@@ -1,0 +1,150 @@
+name: Android Release
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Git tag and GitHub Release tag to create or update
+        required: true
+        default: android-v0.1.0
+      release_name:
+        description: GitHub Release title
+        required: true
+        default: SteadyDrive Android
+      version_name:
+        description: Android versionName
+        required: true
+        default: 0.1.0
+      version_code:
+        description: Android versionCode. This must increase for every installable update.
+        required: true
+        default: "1"
+      prerelease:
+        description: Mark the GitHub Release as a prerelease
+        required: true
+        type: boolean
+        default: false
+
+concurrency:
+  group: android-release-${{ github.event.inputs.release_tag }}
+  cancel-in-progress: false
+
+jobs:
+  build-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+
+      - name: Install Android platform packages
+        run: sdkmanager "platforms;android-35" "build-tools;35.0.0"
+
+      - name: Decode Android keystore
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          if [[ -z "$ANDROID_KEYSTORE_BASE64" ]]; then
+            echo "ANDROID_KEYSTORE_BASE64 is missing."
+            exit 1
+          fi
+
+          if [[ -z "$ANDROID_KEYSTORE_PASSWORD" ]]; then
+            echo "ANDROID_KEYSTORE_PASSWORD is missing."
+            exit 1
+          fi
+
+          if [[ -z "$ANDROID_KEY_ALIAS" ]]; then
+            echo "ANDROID_KEY_ALIAS is missing."
+            exit 1
+          fi
+
+          if [[ -z "$ANDROID_KEY_PASSWORD" ]]; then
+            echo "ANDROID_KEY_PASSWORD is missing."
+            exit 1
+          fi
+
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/steadydrive-release.keystore"
+
+      - name: Build signed release APK
+        env:
+          STEADYDRIVE_RELEASE_STORE_FILE: ${{ runner.temp }}/steadydrive-release.keystore
+          STEADYDRIVE_RELEASE_STORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          STEADYDRIVE_RELEASE_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          STEADYDRIVE_RELEASE_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          chmod +x gradlew
+
+          ./gradlew app:lintRelease app:assembleRelease \
+            -PSTEADYDRIVE_VERSION_NAME="${{ inputs.version_name }}" \
+            -PSTEADYDRIVE_VERSION_CODE="${{ inputs.version_code }}" \
+            -PSTEADYDRIVE_RELEASE_STORE_FILE="$STEADYDRIVE_RELEASE_STORE_FILE" \
+            -PSTEADYDRIVE_RELEASE_STORE_PASSWORD="$STEADYDRIVE_RELEASE_STORE_PASSWORD" \
+            -PSTEADYDRIVE_RELEASE_KEY_ALIAS="$STEADYDRIVE_RELEASE_KEY_ALIAS" \
+            -PSTEADYDRIVE_RELEASE_KEY_PASSWORD="$STEADYDRIVE_RELEASE_KEY_PASSWORD"
+
+      - name: Prepare release assets
+        env:
+          VERSION_NAME: ${{ inputs.version_name }}
+        run: |
+          RELEASE_DIR="app/build/outputs/apk/release"
+          SIGNED_APK="$(find "$RELEASE_DIR" -maxdepth 1 -type f -name '*.apk' ! -name '*unsigned*' | head -n 1)"
+
+          if [[ -z "$SIGNED_APK" ]]; then
+            echo "No signed release APK was found in $RELEASE_DIR."
+            echo "Available files:"
+            find "$RELEASE_DIR" -maxdepth 1 -type f | sort
+            exit 1
+          fi
+
+          cp "$SIGNED_APK" "$RUNNER_TEMP/steady-drive.apk"
+          cp "$SIGNED_APK" "$RUNNER_TEMP/steady-drive-${VERSION_NAME}.apk"
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PRERELEASE: ${{ inputs.prerelease }}
+          RELEASE_NAME: ${{ inputs.release_name }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          VERSION_NAME: ${{ inputs.version_name }}
+        run: |
+          PRERELEASE_FLAG=()
+          if [[ "$PRERELEASE" == "true" ]]; then
+            PRERELEASE_FLAG+=(--prerelease)
+          fi
+
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" \
+              "$RUNNER_TEMP/steady-drive.apk" \
+              "$RUNNER_TEMP/steady-drive-${VERSION_NAME}.apk" \
+              --clobber
+          else
+            gh release create "$RELEASE_TAG" \
+              "$RUNNER_TEMP/steady-drive.apk" \
+              "$RUNNER_TEMP/steady-drive-${VERSION_NAME}.apk" \
+              --title "$RELEASE_NAME" \
+              --generate-notes \
+              "${PRERELEASE_FLAG[@]}"
+          fi

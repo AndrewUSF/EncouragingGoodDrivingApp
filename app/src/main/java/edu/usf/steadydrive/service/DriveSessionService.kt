@@ -1,0 +1,440 @@
+package edu.usf.steadydrive.service
+
+import android.Manifest
+import android.annotation.SuppressLint
+import android.app.Notification
+import android.app.Service
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import android.content.pm.PackageManager
+import android.location.Location
+import android.os.BatteryManager
+import android.os.Build
+import android.os.IBinder
+import android.os.Looper
+import androidx.core.content.ContextCompat
+import androidx.core.app.NotificationCompat
+import androidx.core.app.NotificationManagerCompat
+import com.google.android.gms.location.LocationCallback
+import com.google.android.gms.location.LocationRequest
+import com.google.android.gms.location.LocationResult
+import com.google.android.gms.location.LocationServices
+import com.google.android.gms.location.Priority
+import edu.usf.steadydrive.R
+import edu.usf.steadydrive.SteadyDriveApplication
+import edu.usf.steadydrive.data.CsvSessionWriter
+import edu.usf.steadydrive.data.DownloadsExporter
+import edu.usf.steadydrive.data.StudyRepository
+import edu.usf.steadydrive.model.AssignedDeviceConfig
+import edu.usf.steadydrive.model.DriveSample
+import edu.usf.steadydrive.model.DriveSessionSummary
+import edu.usf.steadydrive.model.ParticipantPhase
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.time.Instant
+import java.util.Locale
+import java.util.UUID
+
+class DriveSessionService : Service() {
+    private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+    private val repository by lazy { StudyRepository(applicationContext) }
+    private val downloadsExporter by lazy { DownloadsExporter(applicationContext) }
+    private val fusedLocationClient by lazy {
+        LocationServices.getFusedLocationProviderClient(applicationContext)
+    }
+    private val audioController by lazy { AudioInterventionController(applicationContext) }
+    private val speedLimitProvider: SpeedLimitProvider by lazy { PortalSpeedLimitProvider(repository) }
+
+    private var latestLocation: Location? = null
+    private lateinit var locationCallback: LocationCallback
+    private var sessionJob: Job? = null
+    private var csvWriter: CsvSessionWriter? = null
+    private var startedAt: Instant? = null
+    private var participantId: String? = null
+    private var phase: ParticipantPhase? = null
+    private var sessionId: String? = null
+
+    private var samplesRecorded = 0
+    private var speedSum = 0.0
+    private var speedCount = 0
+    private var peakSpeedMph = 0.0
+    private var maxOverLimitMph = 0.0
+    private var speedingSeconds = 0
+
+    override fun onCreate() {
+        super.onCreate()
+        locationCallback =
+            object : LocationCallback() {
+                override fun onLocationResult(result: LocationResult) {
+                    latestLocation = result.lastLocation ?: latestLocation
+                }
+            }
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (intent?.action != ACTION_START_SESSION || sessionJob != null) {
+            return START_NOT_STICKY
+        }
+
+        val phaseValue = intent.getStringExtra(EXTRA_PHASE)
+        val resolvedPhase = ParticipantPhase.fromWireValue(phaseValue)
+        val resolvedParticipantId = intent.getStringExtra(EXTRA_PARTICIPANT_ID)
+
+        if (resolvedPhase == null || resolvedParticipantId.isNullOrBlank()) {
+            stopSelf()
+            return START_NOT_STICKY
+        }
+
+        val resolvedSessionId = UUID.randomUUID().toString()
+        resetSessionState(resolvedSessionId)
+
+        phase = resolvedPhase
+        participantId = resolvedParticipantId
+        startedAt = Instant.now()
+        csvWriter = CsvSessionWriter(applicationContext, resolvedParticipantId, resolvedSessionId)
+
+        startForeground(
+            SESSION_NOTIFICATION_ID,
+            buildNotification(TOTAL_SESSION_SECONDS),
+        )
+        startLocationUpdates()
+        startSessionLoop()
+        return START_STICKY
+    }
+
+    override fun onBind(intent: Intent?): IBinder? = null
+
+    override fun onDestroy() {
+        sessionJob?.cancel()
+        stopLocationUpdates()
+        audioController.release()
+        runCatching { csvWriter?.close() }
+        serviceScope.cancel()
+        super.onDestroy()
+    }
+
+    private fun resetSessionState(resolvedSessionId: String) {
+        latestLocation = null
+        sessionId = resolvedSessionId
+        samplesRecorded = 0
+        speedSum = 0.0
+        speedCount = 0
+        peakSpeedMph = 0.0
+        maxOverLimitMph = 0.0
+        speedingSeconds = 0
+    }
+
+    private fun startSessionLoop() {
+        val activePhase = phase ?: return
+        val activeParticipantId = participantId ?: return
+        val activeSessionId = sessionId ?: return
+        val writer = csvWriter ?: return
+
+        sessionJob =
+            serviceScope.launch {
+                for (elapsedSeconds in 0 until TOTAL_SESSION_SECONDS) {
+                    val remainingSeconds = TOTAL_SESSION_SECONDS - elapsedSeconds
+                    val collecting = elapsedSeconds >= WARMUP_SECONDS
+                    val speedLimit = speedLimitProvider.currentPostedSpeedLimit(latestLocation)
+                    val speedMph = latestLocation?.speed?.toDouble()?.metersPerSecondToMph()
+                    val overLimitMph =
+                        if (speedMph != null && speedLimit.speedLimitMph != null) {
+                            speedMph - speedLimit.speedLimitMph
+                        } else {
+                            null
+                        }
+                    val speedingThreePlus = (overLimitMph ?: Double.NEGATIVE_INFINITY) >= 3.0
+                    val shouldMuteForSpeeding =
+                        activePhase == ParticipantPhase.PHASE_B && speedingThreePlus
+
+                    audioController.update(activePhase, shouldMuteForSpeeding)
+
+                    val sample =
+                        DriveSample(
+                            timestampUtc = Instant.now().toString(),
+                            participantId = activeParticipantId,
+                            sessionId = activeSessionId,
+                            phase = activePhase.wireValue,
+                            elapsedSeconds = elapsedSeconds,
+                            collecting = collecting,
+                            latitude = latestLocation?.latitude,
+                            longitude = latestLocation?.longitude,
+                            gpsAccuracyMeters = latestLocation?.accuracy?.toDouble(),
+                            speedMph = speedMph,
+                            speedLimitMph = speedLimit.speedLimitMph,
+                            overLimitMph = overLimitMph,
+                            speedingThreePlus = speedingThreePlus,
+                            heading = latestLocation?.bearing?.toDouble(),
+                            mediaState = audioController.mediaState,
+                            interventionAction = audioController.interventionAction,
+                            speedLimitSource = speedLimit.source,
+                            speedLimitConfidence = speedLimit.confidence,
+                            batteryPercent = currentBatteryPercent(),
+                            networkState = currentNetworkState(),
+                            appState = if (collecting) "active_collection" else "warmup",
+                        )
+
+                    writer.append(sample)
+                    updateSummary(sample, collecting)
+                    broadcastState(remainingSeconds, false, writer.fileName)
+                    updateNotification(remainingSeconds)
+                    delay(1_000)
+                }
+
+                completeSession(
+                    writer = writer,
+                    activeSessionId = activeSessionId,
+                    activeParticipantId = activeParticipantId,
+                    activePhase = activePhase,
+                )
+            }
+    }
+
+    private suspend fun completeSession(
+        writer: CsvSessionWriter,
+        activeSessionId: String,
+        activeParticipantId: String,
+        activePhase: ParticipantPhase,
+    ) {
+        audioController.release()
+        stopLocationUpdates()
+        writer.close()
+
+        val endedAt = Instant.now()
+        val averageSpeed =
+            if (speedCount > 0) {
+                speedSum / speedCount
+            } else {
+                null
+            }
+
+        val downloadsFileName =
+            withContext(Dispatchers.IO) {
+                downloadsExporter.exportCsv(writer.file, writer.fileName)
+            }
+
+        repository.enqueueSessionUpload(
+            DriveSessionSummary(
+                sessionId = activeSessionId,
+                participantId = activeParticipantId,
+                phase = activePhase.wireValue,
+                startedAt = startedAt?.toString().orEmpty(),
+                endedAt = endedAt.toString(),
+                localFileName = writer.fileName,
+                downloadsFileName = downloadsFileName,
+                samplesRecorded = samplesRecorded,
+                averageSpeedMph = averageSpeed,
+                peakSpeedMph = if (peakSpeedMph > 0.0) peakSpeedMph else null,
+                maxOverLimitMph = if (maxOverLimitMph > 0.0) maxOverLimitMph else null,
+                speedingSeconds = speedingSeconds,
+                completionStatus = "completed",
+            ),
+            writer.file.absolutePath,
+        )
+
+        val displayFileName = downloadsFileName ?: writer.fileName
+        broadcastState(0, true, displayFileName)
+        stopForeground(STOP_FOREGROUND_REMOVE)
+
+        if (canPostNotifications()) {
+            notifyWithPermission(
+                buildCompletionNotification(
+                    fileName = displayFileName,
+                    exportedToDownloads = downloadsFileName != null,
+                ),
+            )
+        }
+
+        stopSelf()
+    }
+
+    private fun updateSummary(sample: DriveSample, collecting: Boolean) {
+        samplesRecorded += 1
+        if (!collecting) {
+            return
+        }
+
+        sample.speedMph?.let { speed ->
+            speedSum += speed
+            speedCount += 1
+            if (speed > peakSpeedMph) {
+                peakSpeedMph = speed
+            }
+        }
+
+        sample.overLimitMph?.let { overLimit ->
+            if (overLimit > maxOverLimitMph) {
+                maxOverLimitMph = overLimit
+            }
+            if (overLimit >= 3.0) {
+                speedingSeconds += 1
+            }
+        }
+    }
+
+    private fun startLocationUpdates() {
+        if (!hasLocationPermission()) {
+            return
+        }
+
+        val locationRequest =
+            LocationRequest.Builder(Priority.PRIORITY_HIGH_ACCURACY, 1_000L)
+                .setMinUpdateIntervalMillis(1_000L)
+                .build()
+
+        runCatching { requestLocationUpdatesWithPermission(locationRequest) }
+    }
+
+    private fun stopLocationUpdates() {
+        runCatching {
+            fusedLocationClient.removeLocationUpdates(locationCallback)
+        }
+    }
+
+    private fun broadcastState(
+        remainingSeconds: Int,
+        completed: Boolean,
+        csvFileName: String,
+    ) {
+        val intent =
+            Intent(ACTION_SESSION_STATE).apply {
+                setPackage(packageName)
+                putExtra(EXTRA_REMAINING_SECONDS, remainingSeconds)
+                putExtra(EXTRA_COMPLETED, completed)
+                putExtra(EXTRA_CSV_FILE_NAME, csvFileName)
+            }
+        sendBroadcast(intent)
+    }
+
+    private fun buildNotification(remainingSeconds: Int): Notification =
+        NotificationCompat.Builder(this, SteadyDriveApplication.CHANNEL_DRIVE_SESSION)
+            .setSmallIcon(R.drawable.ic_notification)
+            .setContentTitle(getString(R.string.drive_session_notification_title))
+            .setContentText(
+                "${getString(R.string.drive_session_notification_body)} ${formatRemaining(remainingSeconds)} left.",
+            )
+            .setOngoing(true)
+            .setOnlyAlertOnce(true)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .build()
+
+    private fun buildCompletionNotification(
+        fileName: String,
+        exportedToDownloads: Boolean,
+    ): Notification {
+        val completionText =
+            if (exportedToDownloads) {
+                "CSV saved to Downloads as $fileName. Uploading automatically."
+            } else {
+                "CSV saved locally as $fileName. Uploading automatically."
+            }
+
+        return NotificationCompat.Builder(this, SteadyDriveApplication.CHANNEL_DRIVE_SESSION)
+            .setSmallIcon(R.drawable.ic_notification)
+            .setContentTitle("Data collection complete")
+            .setContentText(completionText)
+            .setAutoCancel(true)
+            .setPriority(NotificationCompat.PRIORITY_DEFAULT)
+            .build()
+    }
+
+    private fun updateNotification(remainingSeconds: Int) {
+        if (canPostNotifications()) {
+            notifyWithPermission(buildNotification(remainingSeconds))
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun notifyWithPermission(notification: Notification) {
+        NotificationManagerCompat.from(this).notify(SESSION_NOTIFICATION_ID, notification)
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun requestLocationUpdatesWithPermission(locationRequest: LocationRequest) {
+        fusedLocationClient.requestLocationUpdates(
+            locationRequest,
+            locationCallback,
+            Looper.getMainLooper(),
+        )
+    }
+
+    private fun canPostNotifications(): Boolean =
+        Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
+            ContextCompat.checkSelfPermission(
+                this,
+                Manifest.permission.POST_NOTIFICATIONS,
+            ) == PackageManager.PERMISSION_GRANTED
+
+    private fun hasLocationPermission(): Boolean =
+        ContextCompat.checkSelfPermission(
+            this,
+            Manifest.permission.ACCESS_FINE_LOCATION,
+        ) == PackageManager.PERMISSION_GRANTED ||
+            ContextCompat.checkSelfPermission(
+                this,
+                Manifest.permission.ACCESS_COARSE_LOCATION,
+            ) == PackageManager.PERMISSION_GRANTED
+
+    private fun currentBatteryPercent(): Int? {
+        val batteryIntent = registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+        val level = batteryIntent?.getIntExtra(BatteryManager.EXTRA_LEVEL, -1) ?: return null
+        val scale = batteryIntent.getIntExtra(BatteryManager.EXTRA_SCALE, -1)
+        if (level < 0 || scale <= 0) {
+            return null
+        }
+        return ((level / scale.toFloat()) * 100).toInt()
+    }
+
+    private fun currentNetworkState(): String {
+        val connectivityManager =
+            getSystemService(Context.CONNECTIVITY_SERVICE) as android.net.ConnectivityManager
+        val activeNetwork = connectivityManager.activeNetwork ?: return "offline"
+        val capabilities = connectivityManager.getNetworkCapabilities(activeNetwork) ?: return "offline"
+
+        return when {
+            capabilities.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI) -> "wifi"
+            capabilities.hasTransport(android.net.NetworkCapabilities.TRANSPORT_CELLULAR) -> "cellular"
+            else -> "other"
+        }
+    }
+
+    private fun Double.metersPerSecondToMph(): Double = this * 2.23693629
+
+    private fun formatRemaining(remainingSeconds: Int): String {
+        val minutes = remainingSeconds / 60
+        val seconds = remainingSeconds % 60
+        return String.format(Locale.US, "%02d:%02d", minutes, seconds)
+    }
+
+    companion object {
+        const val TOTAL_SESSION_SECONDS = 17 * 60
+        const val WARMUP_SECONDS = 2 * 60
+
+        const val ACTION_START_SESSION = "edu.usf.steadydrive.action.START_SESSION"
+        const val ACTION_SESSION_STATE = "edu.usf.steadydrive.action.SESSION_STATE"
+        const val EXTRA_PHASE = "extra_phase"
+        const val EXTRA_PARTICIPANT_ID = "extra_participant_id"
+        const val EXTRA_REMAINING_SECONDS = "extra_remaining_seconds"
+        const val EXTRA_COMPLETED = "extra_completed"
+        const val EXTRA_CSV_FILE_NAME = "extra_csv_file_name"
+
+        private const val SESSION_NOTIFICATION_ID = 6001
+
+        fun createStartIntent(
+            context: Context,
+            config: AssignedDeviceConfig,
+        ): Intent =
+            Intent(context, DriveSessionService::class.java).apply {
+                action = ACTION_START_SESSION
+                putExtra(EXTRA_PARTICIPANT_ID, config.participantId)
+                putExtra(EXTRA_PHASE, config.phase.wireValue)
+            }
+    }
+}

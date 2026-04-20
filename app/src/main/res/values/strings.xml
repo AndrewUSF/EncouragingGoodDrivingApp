@@ -1,0 +1,9 @@
+<resources>
+    <string name="app_name">SteadyDrive</string>
+    <string name="drive_reminder_channel_name">Drive reminders</string>
+    <string name="drive_session_channel_name">Drive session</string>
+    <string name="drive_reminder_title">Drive reminder</string>
+    <string name="drive_reminder_body">Open SteadyDrive and tap Start when you get in the car.</string>
+    <string name="drive_session_notification_title">SteadyDrive session running</string>
+    <string name="drive_session_notification_body">Collecting study data for the current drive session.</string>
+</resources>
