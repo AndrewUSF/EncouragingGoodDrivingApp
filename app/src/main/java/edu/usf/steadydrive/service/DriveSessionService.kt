@@ -13,6 +13,7 @@ import android.os.BatteryManager
 import android.os.Build
 import android.os.IBinder
 import android.os.Looper
+import android.os.PowerManager
 import androidx.core.content.ContextCompat
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
@@ -36,6 +37,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.time.Instant
@@ -51,15 +53,30 @@ class DriveSessionService : Service() {
     }
     private val audioController by lazy { AudioInterventionController(applicationContext) }
     private val speedLimitProvider: SpeedLimitProvider by lazy { PortalSpeedLimitProvider(repository) }
+    private val powerManager by lazy { getSystemService(Context.POWER_SERVICE) as PowerManager }
 
     private var latestLocation: Location? = null
     private lateinit var locationCallback: LocationCallback
     private var sessionJob: Job? = null
+    private var speedLimitJob: Job? = null
+    private var stopWatcherJob: Job? = null
+    private var wakeLock: PowerManager.WakeLock? = null
     private var csvWriter: CsvSessionWriter? = null
     private var startedAt: Instant? = null
     private var participantId: String? = null
     private var phase: ParticipantPhase? = null
     private var sessionId: String? = null
+
+    @Volatile
+    private var stopRequested = false
+
+    @Volatile
+    private var currentSpeedLimit =
+        PostedSpeedLimit(
+            speedLimitMph = null,
+            source = "pending_osm_lookup",
+            confidence = 0.0,
+        )
 
     private var samplesRecorded = 0
     private var speedSum = 0.0
@@ -79,17 +96,34 @@ class DriveSessionService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (intent?.action != ACTION_START_SESSION || sessionJob != null) {
-            return START_NOT_STICKY
-        }
+        when (intent?.action) {
+            ACTION_START_SESSION -> {
+                if (sessionJob == null) {
+                    startNewSession(intent)
+                }
+            }
 
+            ACTION_STOP_SESSION -> {
+                // A researcher (or the app) asked to end the run early. The session loop checks
+                // this flag once per second and finalizes what it has collected so far.
+                if (sessionJob != null) {
+                    stopRequested = true
+                } else {
+                    stopSelf()
+                }
+            }
+        }
+        return START_STICKY
+    }
+
+    private fun startNewSession(intent: Intent) {
         val phaseValue = intent.getStringExtra(EXTRA_PHASE)
         val resolvedPhase = ParticipantPhase.fromWireValue(phaseValue)
         val resolvedParticipantId = intent.getStringExtra(EXTRA_PARTICIPANT_ID)
 
         if (resolvedPhase == null || resolvedParticipantId.isNullOrBlank()) {
             stopSelf()
-            return START_NOT_STICKY
+            return
         }
 
         val resolvedSessionId = UUID.randomUUID().toString()
@@ -100,21 +134,34 @@ class DriveSessionService : Service() {
         startedAt = Instant.now()
         csvWriter = CsvSessionWriter(applicationContext, resolvedParticipantId, resolvedSessionId)
 
+        // Record the active session so the sync loop and the researcher portal can both see that
+        // this device is collecting, and so a remote stop can be matched to the right session.
+        repository.markSessionActive(
+            sessionId = resolvedSessionId,
+            phase = resolvedPhase,
+            startedAtIso = startedAt?.toString().orEmpty(),
+        )
+
+        acquireWakeLock()
         startForeground(
             SESSION_NOTIFICATION_ID,
             buildNotification(TOTAL_SESSION_SECONDS),
         )
         startLocationUpdates()
+        startSpeedLimitUpdates()
+        startStopWatcher()
         startSessionLoop()
-        return START_STICKY
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onDestroy() {
         sessionJob?.cancel()
+        speedLimitJob?.cancel()
+        stopWatcherJob?.cancel()
         stopLocationUpdates()
         audioController.release()
+        releaseWakeLock()
         runCatching { csvWriter?.close() }
         serviceScope.cancel()
         super.onDestroy()
@@ -123,6 +170,13 @@ class DriveSessionService : Service() {
     private fun resetSessionState(resolvedSessionId: String) {
         latestLocation = null
         sessionId = resolvedSessionId
+        stopRequested = false
+        currentSpeedLimit =
+            PostedSpeedLimit(
+                speedLimitMph = null,
+                source = "pending_osm_lookup",
+                confidence = 0.0,
+            )
         samplesRecorded = 0
         speedSum = 0.0
         speedCount = 0
@@ -131,18 +185,31 @@ class DriveSessionService : Service() {
         speedingSeconds = 0
     }
 
+    /**
+     * Drives sampling off the wall clock instead of counting [delay] iterations. Even if the device
+     * dozes or a tick runs long, each pass recomputes the true elapsed time, so the countdown never
+     * falls behind and the session always ends 17 minutes after it started.
+     */
     private fun startSessionLoop() {
         val activePhase = phase ?: return
         val activeParticipantId = participantId ?: return
         val activeSessionId = sessionId ?: return
         val writer = csvWriter ?: return
+        val startMillis = (startedAt ?: Instant.now()).toEpochMilli()
 
         sessionJob =
             serviceScope.launch {
-                for (elapsedSeconds in 0 until TOTAL_SESSION_SECONDS) {
-                    val remainingSeconds = TOTAL_SESSION_SECONDS - elapsedSeconds
+                while (true) {
+                    val nowMillis = System.currentTimeMillis()
+                    val elapsedSeconds = ((nowMillis - startMillis) / 1_000L).toInt().coerceAtLeast(0)
+
+                    if (stopRequested || elapsedSeconds >= TOTAL_SESSION_SECONDS) {
+                        break
+                    }
+
+                    val remainingSeconds = (TOTAL_SESSION_SECONDS - elapsedSeconds).coerceAtLeast(0)
                     val collecting = elapsedSeconds >= WARMUP_SECONDS
-                    val speedLimit = speedLimitProvider.currentPostedSpeedLimit(latestLocation)
+                    val speedLimit = currentSpeedLimit
                     val speedMph = latestLocation?.speed?.toDouble()?.metersPerSecondToMph()
                     val overLimitMph =
                         if (speedMph != null && speedLimit.speedLimitMph != null) {
@@ -185,7 +252,12 @@ class DriveSessionService : Service() {
                     updateSummary(sample, collecting)
                     broadcastState(remainingSeconds, false, writer.fileName)
                     updateNotification(remainingSeconds)
-                    delay(1_000)
+
+                    // Sleep only until the next whole-second boundary relative to the start time, so
+                    // any time spent doing the work above does not accumulate into drift.
+                    val nextBoundaryMillis = startMillis + (elapsedSeconds + 1).toLong() * 1_000L
+                    val sleepMillis = nextBoundaryMillis - System.currentTimeMillis()
+                    delay(sleepMillis.coerceIn(1L, 1_000L))
                 }
 
                 completeSession(
@@ -193,6 +265,7 @@ class DriveSessionService : Service() {
                     activeSessionId = activeSessionId,
                     activeParticipantId = activeParticipantId,
                     activePhase = activePhase,
+                    completionStatus = if (stopRequested) "stopped_early" else "completed",
                 )
             }
     }
@@ -202,7 +275,10 @@ class DriveSessionService : Service() {
         activeSessionId: String,
         activeParticipantId: String,
         activePhase: ParticipantPhase,
+        completionStatus: String,
     ) {
+        speedLimitJob?.cancel()
+        stopWatcherJob?.cancel()
         audioController.release()
         stopLocationUpdates()
         writer.close()
@@ -234,13 +310,18 @@ class DriveSessionService : Service() {
                 peakSpeedMph = if (peakSpeedMph > 0.0) peakSpeedMph else null,
                 maxOverLimitMph = if (maxOverLimitMph > 0.0) maxOverLimitMph else null,
                 speedingSeconds = speedingSeconds,
-                completionStatus = "completed",
+                completionStatus = completionStatus,
             ),
             writer.file.absolutePath,
         )
 
+        // The run is over locally; clear the active-session marker so the next sync reports the
+        // device as idle and the portal re-enables phase changes.
+        repository.markSessionInactive()
+
         val displayFileName = downloadsFileName ?: writer.fileName
         broadcastState(0, true, displayFileName)
+        releaseWakeLock()
         stopForeground(STOP_FOREGROUND_REMOVE)
 
         if (canPostNotifications()) {
@@ -277,6 +358,72 @@ class DriveSessionService : Service() {
                 speedingSeconds += 1
             }
         }
+    }
+
+    /**
+     * Polls the posted speed limit on its own cadence so the per-second sampling loop never blocks
+     * on a network round trip. The provider itself throttles how often it actually calls the portal.
+     */
+    private fun startSpeedLimitUpdates() {
+        speedLimitJob =
+            serviceScope.launch(Dispatchers.IO) {
+                while (isActive) {
+                    val location = latestLocation
+                    if (location != null) {
+                        runCatching { speedLimitProvider.currentPostedSpeedLimit(location) }
+                            .onSuccess { currentSpeedLimit = it }
+                    }
+                    delay(SPEED_LIMIT_POLL_MILLIS)
+                }
+            }
+    }
+
+    /**
+     * Periodically reports that this device is actively collecting and checks whether a researcher
+     * has asked the portal to stop the session. Runs independently of the foreground UI so a remote
+     * stop is honored even when the participant's screen is off.
+     */
+    private fun startStopWatcher() {
+        stopWatcherJob =
+            serviceScope.launch(Dispatchers.IO) {
+                while (isActive) {
+                    val active = repository.activeSession()
+                    if (active != null) {
+                        // Reports "running" on the very first pass so the portal can lock phase
+                        // changes promptly, then keeps checking for a researcher stop request.
+                        val shouldStop =
+                            runCatching { repository.reportRunningSessionAndCheckStop(active) }
+                                .getOrDefault(false)
+                        if (shouldStop) {
+                            stopRequested = true
+                            break
+                        }
+                    }
+                    delay(STOP_POLL_MILLIS)
+                }
+            }
+    }
+
+    private fun acquireWakeLock() {
+        releaseWakeLock()
+        wakeLock =
+            powerManager
+                .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, WAKE_LOCK_TAG)
+                .apply {
+                    setReferenceCounted(false)
+                    // Time out a little after the longest possible run so a crashed finalize can
+                    // never leave the CPU pinned awake indefinitely.
+                    runCatching { acquire((TOTAL_SESSION_SECONDS + 120).toLong() * 1_000L) }
+                }
+    }
+
+    private fun releaseWakeLock() {
+        wakeLock?.let { lock ->
+            if (lock.isHeld) {
+                runCatching { lock.release() }
+            }
+        }
+        wakeLock = null
     }
 
     private fun startLocationUpdates() {
@@ -418,6 +565,7 @@ class DriveSessionService : Service() {
         const val WARMUP_SECONDS = 2 * 60
 
         const val ACTION_START_SESSION = "edu.usf.steadydrive.action.START_SESSION"
+        const val ACTION_STOP_SESSION = "edu.usf.steadydrive.action.STOP_SESSION"
         const val ACTION_SESSION_STATE = "edu.usf.steadydrive.action.SESSION_STATE"
         const val EXTRA_PHASE = "extra_phase"
         const val EXTRA_PARTICIPANT_ID = "extra_participant_id"
@@ -426,6 +574,9 @@ class DriveSessionService : Service() {
         const val EXTRA_CSV_FILE_NAME = "extra_csv_file_name"
 
         private const val SESSION_NOTIFICATION_ID = 6001
+        private const val SPEED_LIMIT_POLL_MILLIS = 2_000L
+        private const val STOP_POLL_MILLIS = 12_000L
+        private const val WAKE_LOCK_TAG = "SteadyDrive::DriveSession"
 
         fun createStartIntent(
             context: Context,
@@ -435,6 +586,11 @@ class DriveSessionService : Service() {
                 action = ACTION_START_SESSION
                 putExtra(EXTRA_PARTICIPANT_ID, config.participantId)
                 putExtra(EXTRA_PHASE, config.phase.wireValue)
+            }
+
+        fun createStopIntent(context: Context): Intent =
+            Intent(context, DriveSessionService::class.java).apply {
+                action = ACTION_STOP_SESSION
             }
     }
 }

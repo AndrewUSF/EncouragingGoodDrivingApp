@@ -42,10 +42,19 @@ class MobileApiClient(
 
     suspend fun fetchConfig(
         credentials: StudyPreferences.InstallationCredentials,
+        activeSession: StudyPreferences.ActiveSession?,
     ): RemoteConfigResult = withContext(Dispatchers.IO) {
         val payload = JSONObject()
             .put("installationId", credentials.installationId)
             .put("deviceSecret", credentials.deviceSecret)
+            .put("sessionState", if (activeSession != null) "running" else "idle")
+
+        if (activeSession != null) {
+            payload
+                .put("activeSessionId", activeSession.sessionId)
+                .put("activePhase", activeSession.phase.wireValue)
+                .put("sessionStartedAt", activeSession.startedAtIso)
+        }
 
         val response = postJson("/api/mobile/config", payload)
         val status = response.getString("status")
@@ -87,6 +96,7 @@ class MobileApiClient(
                     },
                 schedules = schedules,
             ),
+            stopRequested = response.optBoolean("stopRequested", false),
         )
     }
 
@@ -257,7 +267,10 @@ class MobileApiClient(
 
     sealed interface RemoteConfigResult {
         data object Pending : RemoteConfigResult
-        data class Assigned(val config: AssignedDeviceConfig) : RemoteConfigResult
+        data class Assigned(
+            val config: AssignedDeviceConfig,
+            val stopRequested: Boolean = false,
+        ) : RemoteConfigResult
     }
 
     sealed interface UploadResult {

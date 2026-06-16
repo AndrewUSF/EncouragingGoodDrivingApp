@@ -33,8 +33,8 @@ data class DriveSample(
             phase,
             elapsedSeconds.toString(),
             if (collecting) "1" else "0",
-            formatNumber(latitude),
-            formatNumber(longitude),
+            formatCoordinate(latitude),
+            formatCoordinate(longitude),
             formatNumber(gpsAccuracyMeters),
             formatNumber(speedMph),
             formatNumber(speedLimitMph),
@@ -52,6 +52,12 @@ data class DriveSample(
 
     private fun formatNumber(value: Double?): String =
         value?.let { String.format(Locale.US, "%.2f", it) }.orEmpty()
+
+    // Latitude/longitude need far more precision than the other metrics: at this latitude six
+    // decimal places is roughly 0.1 m, whereas the two used for speeds collapses an entire drive
+    // onto a single ~1 km coordinate.
+    private fun formatCoordinate(value: Double?): String =
+        value?.let { String.format(Locale.US, "%.6f", it) }.orEmpty()
 
     private fun escapeCsv(value: String): String {
         if (!value.contains(",") && !value.contains("\"") && !value.contains("\n")) {

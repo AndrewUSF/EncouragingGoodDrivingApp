@@ -4,6 +4,7 @@ import android.content.Context
 import edu.usf.steadydrive.BuildConfig
 import edu.usf.steadydrive.model.AssignedDeviceConfig
 import edu.usf.steadydrive.model.DriveSessionSummary
+import edu.usf.steadydrive.model.ParticipantPhase
 import edu.usf.steadydrive.service.PostedSpeedLimit
 import java.io.File
 
@@ -32,11 +33,25 @@ class StudyRepository(
         preferences.clearAssignedConfig()
     }
 
+    fun markSessionActive(
+        sessionId: String,
+        phase: ParticipantPhase,
+        startedAtIso: String,
+    ) {
+        preferences.setActiveSession(sessionId, phase, startedAtIso)
+    }
+
+    fun markSessionInactive() {
+        preferences.clearActiveSession()
+    }
+
+    fun activeSession(): StudyPreferences.ActiveSession? = preferences.getActiveSession()
+
     suspend fun syncWithServer(): SyncResult {
         val credentials = preferences.getInstallationCredentials()
         apiClient.registerDevice(credentials)
 
-        return when (val result = apiClient.fetchConfig(credentials)) {
+        return when (val result = apiClient.fetchConfig(credentials, preferences.getActiveSession())) {
             MobileApiClient.RemoteConfigResult.Pending -> {
                 clearAssignedStudyState()
                 SyncResult.Pending
@@ -47,6 +62,21 @@ class StudyRepository(
                 reminderScheduler.scheduleWeeklyReminders(result.config.schedules)
                 SyncResult.Assigned(result.config)
             }
+        }
+    }
+
+    /**
+     * Reports that this device is mid-session and returns whether a researcher has requested an
+     * early stop from the portal. Used by the foreground service so the stop is honored even when
+     * the app UI is not in the foreground.
+     */
+    suspend fun reportRunningSessionAndCheckStop(
+        activeSession: StudyPreferences.ActiveSession,
+    ): Boolean {
+        val credentials = preferences.getInstallationCredentials()
+        return when (val result = apiClient.fetchConfig(credentials, activeSession)) {
+            is MobileApiClient.RemoteConfigResult.Assigned -> result.stopRequested
+            MobileApiClient.RemoteConfigResult.Pending -> false
         }
     }
 

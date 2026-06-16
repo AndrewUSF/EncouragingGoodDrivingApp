@@ -88,9 +88,44 @@ class StudyPreferences(context: Context) {
             .apply()
     }
 
+    fun setActiveSession(
+        sessionId: String,
+        phase: ParticipantPhase,
+        startedAtIso: String,
+    ) {
+        preferences.edit()
+            .putString(KEY_ACTIVE_SESSION_ID, sessionId)
+            .putString(KEY_ACTIVE_SESSION_PHASE, phase.wireValue)
+            .putString(KEY_ACTIVE_SESSION_STARTED_AT, startedAtIso)
+            .apply()
+    }
+
+    fun clearActiveSession() {
+        preferences.edit()
+            .remove(KEY_ACTIVE_SESSION_ID)
+            .remove(KEY_ACTIVE_SESSION_PHASE)
+            .remove(KEY_ACTIVE_SESSION_STARTED_AT)
+            .apply()
+    }
+
+    fun getActiveSession(): ActiveSession? {
+        val sessionId = preferences.getString(KEY_ACTIVE_SESSION_ID, null) ?: return null
+        val phase =
+            ParticipantPhase.fromWireValue(preferences.getString(KEY_ACTIVE_SESSION_PHASE, null))
+                ?: return null
+        val startedAtIso = preferences.getString(KEY_ACTIVE_SESSION_STARTED_AT, null) ?: return null
+        return ActiveSession(sessionId = sessionId, phase = phase, startedAtIso = startedAtIso)
+    }
+
     data class InstallationCredentials(
         val installationId: String,
         val deviceSecret: String,
+    )
+
+    data class ActiveSession(
+        val sessionId: String,
+        val phase: ParticipantPhase,
+        val startedAtIso: String,
     )
 
     companion object {
@@ -102,5 +137,8 @@ class StudyPreferences(context: Context) {
         private const val KEY_PHASE = "phase"
         private const val KEY_WEEKLY_NOTES = "weekly_notes"
         private const val KEY_SCHEDULES = "schedules"
+        private const val KEY_ACTIVE_SESSION_ID = "active_session_id"
+        private const val KEY_ACTIVE_SESSION_PHASE = "active_session_phase"
+        private const val KEY_ACTIVE_SESSION_STARTED_AT = "active_session_started_at"
     }
 }
