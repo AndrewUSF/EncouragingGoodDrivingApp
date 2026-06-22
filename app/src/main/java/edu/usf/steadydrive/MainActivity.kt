@@ -1,13 +1,17 @@
 package edu.usf.steadydrive
 
 import android.Manifest
+import android.annotation.SuppressLint
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.PowerManager
+import android.provider.Settings
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -68,6 +72,7 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+        requestBatteryOptimizationExemption()
 
         setContent {
             val uiState = viewModel.uiState.collectAsStateWithLifecycle().value
@@ -106,6 +111,28 @@ class MainActivity : ComponentActivity() {
             receiverRegistered = false
         }
         super.onStop()
+    }
+
+    /**
+     * Asks the participant once to exempt SteadyDrive from battery optimization. Reminders (exact
+     * alarms) and the in-drive foreground service survive Doze far more reliably when the app is not
+     * battery-restricted, which matters on OEMs that aggressively kill background apps. The system
+     * only shows the prompt if the app is not already exempt.
+     */
+    @SuppressLint("BatteryLife")
+    private fun requestBatteryOptimizationExemption() {
+        val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
+        if (powerManager.isIgnoringBatteryOptimizations(packageName)) {
+            return
+        }
+
+        runCatching {
+            startActivity(
+                Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
+                    data = Uri.fromParts("package", packageName, null)
+                },
+            )
+        }
     }
 
     private fun requiredPermissions(): List<String> =

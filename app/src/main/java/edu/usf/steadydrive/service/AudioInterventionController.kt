@@ -1,16 +1,26 @@
 package edu.usf.steadydrive.service
 
 import android.content.Context
-import android.media.AudioAttributes
-import android.media.AudioFocusRequest
 import android.media.AudioManager
 import edu.usf.steadydrive.model.ParticipantPhase
 
+/**
+ * Silences the participant's music by muting the music *stream* and restoring it, instead of
+ * grabbing audio focus.
+ *
+ * The previous implementation requested permanent `AUDIOFOCUS_GAIN` before muting. That tells the
+ * music app (Spotify, YouTube Music, etc.) to *stop*, and most players do not auto-resume when the
+ * focus is later abandoned — so in Phase B the music never came back after the first speeding event
+ * ("stayed muted for the rest of the drive"). Phase A never mutes and Phase C mutes once and stays
+ * muted, so only Phase B exposed the problem.
+ *
+ * Muting the stream volume leaves the player running (silently), so the audio returns the instant we
+ * unmute — exactly the Phase B behavior we want.
+ */
 class AudioInterventionController(
     context: Context,
 ) {
     private val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
-    private var audioFocusRequest: AudioFocusRequest? = null
     private var previousVolume: Int? = null
 
     var isMuted: Boolean = false
@@ -50,40 +60,28 @@ class AudioInterventionController(
             return
         }
 
-        if (previousVolume != null && !audioManager.isVolumeFixed) {
-            audioManager.setStreamVolume(
-                AudioManager.STREAM_MUSIC,
-                previousVolume ?: 0,
-                0,
-            )
-        }
+        // Unmute first, then restore the captured level: some devices ignore setStreamVolume while
+        // the stream is still flagged muted.
         audioManager.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_UNMUTE, 0)
-        audioFocusRequest?.let(audioManager::abandonAudioFocusRequest)
-        audioFocusRequest = null
+        previousVolume?.let { level ->
+            if (!audioManager.isVolumeFixed) {
+                audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, level, 0)
+            }
+        }
+        previousVolume = null
         isMuted = false
         currentReason = null
     }
 
     private fun engage(reason: String) {
-        if (isMuted && currentReason == reason) {
+        // Already silenced (e.g. Phase C re-asserting every tick) — never re-capture the volume,
+        // otherwise we would save the muted level and "restore" silence later.
+        if (isMuted) {
+            currentReason = reason
             return
         }
 
-        if (audioFocusRequest == null) {
-            audioFocusRequest =
-                AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
-                    .setAudioAttributes(
-                        AudioAttributes.Builder()
-                            .setUsage(AudioAttributes.USAGE_MEDIA)
-                            .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
-                            .build(),
-                    )
-                    .setAcceptsDelayedFocusGain(false)
-                    .build()
-        }
-
         previousVolume = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
-        audioManager.requestAudioFocus(audioFocusRequest!!)
         audioManager.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_MUTE, 0)
         isMuted = true
         currentReason = reason

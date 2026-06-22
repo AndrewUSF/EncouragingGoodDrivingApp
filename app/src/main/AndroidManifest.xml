@@ -11,6 +11,15 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- Drive reminders rely on exact alarms. USE_EXACT_ALARM is auto-granted on Android 13+;
+         SCHEDULE_EXACT_ALARM covers Android 12 (deprecated on 13+, hence maxSdkVersion). -->
+    <uses-permission android:name="android.permission.USE_EXACT_ALARM" />
+    <uses-permission
+        android:name="android.permission.SCHEDULE_EXACT_ALARM"
+        android:maxSdkVersion="32" />
+    <!-- Lets the app ask to be exempted from battery optimization so reminders and the in-drive
+         foreground service are not deferred by Doze (especially on aggressive OEMs like Samsung). -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
     <uses-permission
         android:name="android.permission.WRITE_EXTERNAL_STORAGE"
         android:maxSdkVersion="28" />
