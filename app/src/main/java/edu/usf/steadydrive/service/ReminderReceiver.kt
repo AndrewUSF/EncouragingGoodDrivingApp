@@ -17,6 +17,8 @@ import edu.usf.steadydrive.data.StudyRepository
 
 class ReminderReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
+        val dayOfWeek = intent.getIntExtra(EXTRA_DAY_OF_WEEK, 0)
+        val reminderIndex = intent.getIntExtra(EXTRA_REMINDER_INDEX, 0)
         val launchIntent = Intent(context, MainActivity::class.java)
         val contentIntent =
             PendingIntent.getActivity(
@@ -43,12 +45,18 @@ class ReminderReceiver : BroadcastReceiver() {
                 Manifest.permission.POST_NOTIFICATIONS,
             ) == PackageManager.PERMISSION_GRANTED
         ) {
-            NotificationManagerCompat.from(context).notify(5001, notification)
+            NotificationManagerCompat
+                .from(context)
+                .notify(NOTIFICATION_ID_BASE + (dayOfWeek * MAX_REMINDERS_PER_DAY) + reminderIndex, notification)
         }
         StudyRepository(context).scheduleStoredReminders()
     }
 
     companion object {
         const val EXTRA_DAY_OF_WEEK = "extra_day_of_week"
+        const val EXTRA_REMINDER_INDEX = "extra_reminder_index"
+
+        private const val NOTIFICATION_ID_BASE = 5000
+        private const val MAX_REMINDERS_PER_DAY = 3
     }
 }

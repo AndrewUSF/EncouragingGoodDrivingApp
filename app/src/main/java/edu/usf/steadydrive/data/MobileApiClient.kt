@@ -73,6 +73,7 @@ class MobileApiClient(
                 add(
                     ScheduledDrive(
                         dayOfWeek = schedule.getInt("dayOfWeek"),
+                        reminderIndex = schedule.optInt("reminderIndex", 0),
                         startTime =
                             if (schedule.isNull("startTime")) {
                                 null

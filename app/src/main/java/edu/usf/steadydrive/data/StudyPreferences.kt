@@ -31,6 +31,7 @@ class StudyPreferences(context: Context) {
         config.schedules.forEach { schedule ->
             val scheduleObject = JSONObject()
                 .put("dayOfWeek", schedule.dayOfWeek)
+                .put("reminderIndex", schedule.reminderIndex)
                 .put("startTime", schedule.startTime)
             scheduleJson.put(scheduleObject)
         }
@@ -58,6 +59,7 @@ class StudyPreferences(context: Context) {
                 add(
                     ScheduledDrive(
                         dayOfWeek = scheduleObject.getInt("dayOfWeek"),
+                        reminderIndex = scheduleObject.optInt("reminderIndex", 0),
                         startTime =
                             if (scheduleObject.isNull("startTime")) {
                                 null

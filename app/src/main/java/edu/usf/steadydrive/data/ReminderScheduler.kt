@@ -20,17 +20,27 @@ class ReminderScheduler(
         cancelAll()
         schedules.forEach { schedule ->
             val startTime = schedule.startTime ?: return@forEach
-            scheduleReminder(schedule.dayOfWeek, LocalTime.parse(startTime))
+            if (schedule.reminderIndex !in 0 until MAX_REMINDERS_PER_DAY) {
+                return@forEach
+            }
+
+            scheduleReminder(
+                dayOfWeek = schedule.dayOfWeek,
+                reminderIndex = schedule.reminderIndex,
+                startTime = LocalTime.parse(startTime),
+            )
         }
     }
 
     fun cancelAll() {
         repeat(7) { dayIndex ->
-            alarmManager.cancel(createPendingIntent(dayIndex))
+            repeat(MAX_REMINDERS_PER_DAY) { reminderIndex ->
+                alarmManager.cancel(createPendingIntent(dayIndex, reminderIndex))
+            }
         }
     }
 
-    private fun scheduleReminder(dayOfWeek: Int, startTime: LocalTime) {
+    private fun scheduleReminder(dayOfWeek: Int, reminderIndex: Int, startTime: LocalTime) {
         val now = ZonedDateTime.now()
         val todayIndex = now.dayOfWeek.value % 7
         val daysUntil = (dayOfWeek - todayIndex + 7) % 7
@@ -45,7 +55,7 @@ class ReminderScheduler(
             reminderTime = reminderTime.plusWeeks(1)
         }
 
-        val pendingIntent = createPendingIntent(dayOfWeek)
+        val pendingIntent = createPendingIntent(dayOfWeek, reminderIndex)
 
         val canScheduleExactAlarm =
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
@@ -69,13 +79,14 @@ class ReminderScheduler(
         }
     }
 
-    private fun createPendingIntent(dayOfWeek: Int): PendingIntent {
+    private fun createPendingIntent(dayOfWeek: Int, reminderIndex: Int): PendingIntent {
         val intent = Intent(context, ReminderReceiver::class.java).apply {
             putExtra(ReminderReceiver.EXTRA_DAY_OF_WEEK, dayOfWeek)
+            putExtra(ReminderReceiver.EXTRA_REMINDER_INDEX, reminderIndex)
         }
         return PendingIntent.getBroadcast(
             context,
-            REQUEST_CODE_BASE + dayOfWeek,
+            REQUEST_CODE_BASE + (dayOfWeek * MAX_REMINDERS_PER_DAY) + reminderIndex,
             intent,
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
@@ -83,5 +94,6 @@ class ReminderScheduler(
 
     companion object {
         private const val REQUEST_CODE_BASE = 4000
+        private const val MAX_REMINDERS_PER_DAY = 3
     }
 }
