@@ -27,6 +27,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import edu.usf.steadydrive.BuildConfig
 import java.util.Locale
 
 @Composable
@@ -188,6 +189,16 @@ fun SteadyDriveScreen(
                         }
                     }
                 }
+
+                Text(
+                    text = "v${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE})",
+                    fontSize = 11.sp,
+                    color = contentColor.copy(alpha = 0.5f),
+                    modifier =
+                        Modifier
+                            .align(Alignment.BottomEnd)
+                            .padding(12.dp),
+                )
             }
         }
     }
