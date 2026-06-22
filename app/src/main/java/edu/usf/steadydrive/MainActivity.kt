@@ -20,6 +20,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import edu.usf.steadydrive.data.StudyRepository
 import edu.usf.steadydrive.service.DriveSessionService
 import edu.usf.steadydrive.ui.SteadyDriveScreen
 import edu.usf.steadydrive.ui.SteadyDriveViewModel
@@ -69,9 +70,13 @@ class MainActivity : ComponentActivity() {
             pendingStartAfterPermissionGrant = false
         }
 
+    private val notificationPermissionLauncher =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { /* reminders only */ }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+        ensureNotificationPermission()
         requestBatteryOptimizationExemption()
 
         setContent {
@@ -103,6 +108,10 @@ class MainActivity : ComponentActivity() {
             )
             receiverRegistered = true
         }
+
+        // Re-arm reminders every time the app is opened, as a backstop in case the OS or an OEM
+        // battery manager cleared the pending alarms while the app was closed.
+        runCatching { StudyRepository(this).scheduleStoredReminders() }
     }
 
     override fun onStop() {
@@ -111,6 +120,22 @@ class MainActivity : ComponentActivity() {
             receiverRegistered = false
         }
         super.onStop()
+    }
+
+    /**
+     * Requests the notification permission on launch (Android 13+) so drive reminders can be shown
+     * even before the participant starts their first drive. No-op if already granted.
+     */
+    private fun ensureNotificationPermission() {
+        if (
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            ContextCompat.checkSelfPermission(
+                this,
+                Manifest.permission.POST_NOTIFICATIONS,
+            ) != PackageManager.PERMISSION_GRANTED
+        ) {
+            notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+        }
     }
 
     /**

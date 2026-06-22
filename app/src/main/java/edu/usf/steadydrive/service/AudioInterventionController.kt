@@ -5,17 +5,15 @@ import android.media.AudioManager
 import edu.usf.steadydrive.model.ParticipantPhase
 
 /**
- * Silences the participant's music by muting the music *stream* and restoring it, instead of
- * grabbing audio focus.
+ * Silences the participant's music by muting the music *stream* and restoring it, rather than
+ * grabbing audio focus — audio focus tells players to stop, and most never auto-resume, which was
+ * the Phase B "stuck muted" bug.
  *
- * The previous implementation requested permanent `AUDIOFOCUS_GAIN` before muting. That tells the
- * music app (Spotify, YouTube Music, etc.) to *stop*, and most players do not auto-resume when the
- * focus is later abandoned — so in Phase B the music never came back after the first speeding event
- * ("stayed muted for the rest of the drive"). Phase A never mutes and Phase C mutes once and stays
- * muted, so only Phase B exposed the problem.
- *
- * Muting the stream volume leaves the player running (silently), so the audio returns the instant we
- * unmute — exactly the Phase B behavior we want.
+ * For reliability across OEMs and Android versions it silences with two independent mechanisms
+ * (sets the music-stream volume to zero AND flags the stream muted), re-asserts the mute every tick
+ * so a stray volume change cannot defeat it mid-drive, and always restores to an audible level so
+ * music is never left silent. [resetToBaseline] clears any mute orphaned by a previously killed
+ * session before a new one starts.
  */
 class AudioInterventionController(
     context: Context,
@@ -40,6 +38,32 @@ class AudioInterventionController(
                 else -> "none"
             }
 
+    /**
+     * Whether the OS reports the music stream as fixed-volume — i.e. the app cannot change/silence
+     * it on the current output device. Logged per sample so the data shows when an intended mute
+     * could not actually be applied.
+     */
+    val isVolumeFixed: Boolean
+        get() = runCatching { audioManager.isVolumeFixed }.getOrDefault(false)
+
+    /**
+     * Current music-stream volume as a 0–100 percentage (null if it can't be read), so the CSV
+     * reveals whether a mute physically took effect rather than only what was intended.
+     */
+    val musicVolumePercent: Int?
+        get() {
+            val maxVolume =
+                runCatching { audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC) }.getOrNull()
+                    ?: return null
+            if (maxVolume <= 0) {
+                return null
+            }
+            val current =
+                runCatching { audioManager.getStreamVolume(AudioManager.STREAM_MUSIC) }.getOrNull()
+                    ?: return null
+            return (current * 100) / maxVolume
+        }
+
     fun update(phase: ParticipantPhase, shouldMuteForSpeeding: Boolean) {
         when (phase) {
             ParticipantPhase.PHASE_A -> release()
@@ -54,36 +78,74 @@ class AudioInterventionController(
         }
     }
 
+    /**
+     * Returns audio to a known, audible baseline — including clearing a mute that an earlier, killed
+     * session may have left on the stream. Safe to call when nothing is muted; run it at the start
+     * and end of every session.
+     */
+    fun resetToBaseline() {
+        unmuteStream()
+        previousVolume?.let { applyVolume(it) }
+        previousVolume = null
+        isMuted = false
+        currentReason = null
+    }
+
     fun release() {
         if (!isMuted) {
             currentReason = null
             return
         }
 
-        // Unmute first, then restore the captured level: some devices ignore setStreamVolume while
-        // the stream is still flagged muted.
-        audioManager.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_UNMUTE, 0)
-        previousVolume?.let { level ->
-            if (!audioManager.isVolumeFixed) {
-                audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, level, 0)
-            }
-        }
+        // Unmute first, then restore the captured level (some devices ignore setStreamVolume while
+        // the stream is still flagged muted). Never restore to silence.
+        unmuteStream()
+        applyVolume(previousVolume ?: defaultAudibleVolume())
         previousVolume = null
         isMuted = false
         currentReason = null
     }
 
     private fun engage(reason: String) {
-        // Already silenced (e.g. Phase C re-asserting every tick) — never re-capture the volume,
-        // otherwise we would save the muted level and "restore" silence later.
         if (isMuted) {
+            // Re-assert every tick so a stray volume change cannot un-silence Phase B/C mid-drive.
+            applyVolume(0)
             currentReason = reason
             return
         }
 
-        previousVolume = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
-        audioManager.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_MUTE, 0)
+        previousVolume =
+            runCatching { audioManager.getStreamVolume(AudioManager.STREAM_MUSIC) }.getOrNull()
+        applyVolume(0)
+        runCatching {
+            audioManager.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_MUTE, 0)
+        }
         isMuted = true
         currentReason = reason
+    }
+
+    private fun unmuteStream() {
+        runCatching {
+            audioManager.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_UNMUTE, 0)
+        }
+    }
+
+    private fun applyVolume(level: Int) {
+        if (audioManager.isVolumeFixed) {
+            return
+        }
+        val maxVolume =
+            runCatching { audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC) }.getOrNull()
+                ?: return
+        runCatching {
+            audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, level.coerceIn(0, maxVolume), 0)
+        }
+    }
+
+    private fun defaultAudibleVolume(): Int {
+        val maxVolume =
+            runCatching { audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC) }.getOrNull()
+                ?: return 0
+        return (maxVolume / 2).coerceAtLeast(1)
     }
 }

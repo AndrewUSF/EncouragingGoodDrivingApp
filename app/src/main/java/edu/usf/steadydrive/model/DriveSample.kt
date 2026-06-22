@@ -24,6 +24,8 @@ data class DriveSample(
     val batteryPercent: Int?,
     val networkState: String,
     val appState: String,
+    val volumeFixed: Boolean,
+    val mediaVolumePercent: Int?,
 ) {
     fun toCsvRow(): String =
         listOf(
@@ -48,6 +50,8 @@ data class DriveSample(
             batteryPercent?.toString().orEmpty(),
             networkState,
             appState,
+            if (volumeFixed) "1" else "0",
+            mediaVolumePercent?.toString().orEmpty(),
         ).joinToString(",") { escapeCsv(it) }
 
     private fun formatNumber(value: Double?): String =
@@ -71,6 +75,7 @@ data class DriveSample(
             "timestamp_utc,participant_id,session_id,phase,elapsed_s," +
                 "collecting_flag,latitude,longitude,gps_accuracy_m,speed_mph,speed_limit_mph," +
                 "over_limit_mph,speeding_3plus,heading,media_state,intervention_action," +
-                "speed_limit_source,speed_limit_confidence,battery_pct,network_state,app_state"
+                "speed_limit_source,speed_limit_confidence,battery_pct,network_state,app_state," +
+                "volume_fixed,media_volume_pct"
     }
 }

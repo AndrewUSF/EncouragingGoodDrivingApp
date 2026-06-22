@@ -4,6 +4,11 @@ import android.app.Application
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.os.Build
+import androidx.work.ExistingPeriodicWorkPolicy
+import androidx.work.PeriodicWorkRequestBuilder
+import androidx.work.WorkManager
+import edu.usf.steadydrive.worker.ReminderRearmWorker
+import java.util.concurrent.TimeUnit
 
 class SteadyDriveApplication : Application() {
     override fun onCreate() {
@@ -23,6 +28,22 @@ class SteadyDriveApplication : Application() {
                     getString(R.string.drive_session_channel_name),
                     NotificationManager.IMPORTANCE_LOW,
                 ),
+            )
+        }
+
+        scheduleReminderRearmWork()
+    }
+
+    // Re-arm the drive reminders on a recurring schedule as a backstop to the alarm/boot/launch paths,
+    // so they keep firing even if the OS or an OEM battery manager clears the pending alarms.
+    private fun scheduleReminderRearmWork() {
+        runCatching {
+            val request =
+                PeriodicWorkRequestBuilder<ReminderRearmWorker>(3, TimeUnit.HOURS).build()
+            WorkManager.getInstance(this).enqueueUniquePeriodicWork(
+                ReminderRearmWorker.UNIQUE_WORK_NAME,
+                ExistingPeriodicWorkPolicy.KEEP,
+                request,
             )
         }
     }

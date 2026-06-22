@@ -150,6 +150,9 @@ class DriveSessionService : Service() {
         startLocationUpdates()
         startSpeedLimitUpdates()
         startStopWatcher()
+        // Clear any mute a previously killed session may have left on the music stream before this
+        // run's phase logic takes over.
+        audioController.resetToBaseline()
         startSessionLoop()
     }
 
@@ -160,7 +163,7 @@ class DriveSessionService : Service() {
         speedLimitJob?.cancel()
         stopWatcherJob?.cancel()
         stopLocationUpdates()
-        audioController.release()
+        audioController.resetToBaseline()
         releaseWakeLock()
         runCatching { csvWriter?.close() }
         serviceScope.cancel()
@@ -246,6 +249,8 @@ class DriveSessionService : Service() {
                             batteryPercent = currentBatteryPercent(),
                             networkState = currentNetworkState(),
                             appState = if (collecting) "active_collection" else "warmup",
+                            volumeFixed = audioController.isVolumeFixed,
+                            mediaVolumePercent = audioController.musicVolumePercent,
                         )
 
                     writer.append(sample)
@@ -279,7 +284,7 @@ class DriveSessionService : Service() {
     ) {
         speedLimitJob?.cancel()
         stopWatcherJob?.cancel()
-        audioController.release()
+        audioController.resetToBaseline()
         stopLocationUpdates()
         writer.close()
 
