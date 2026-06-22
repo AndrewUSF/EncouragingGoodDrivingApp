@@ -11,8 +11,8 @@ fun readGradleOrEnv(name: String): String? =
     ?.trim()
     ?.takeIf { it.isNotEmpty() }
 
-val resolvedVersionCode = readGradleOrEnv("STEADYDRIVE_VERSION_CODE")?.toIntOrNull() ?: 1
-val resolvedVersionName = readGradleOrEnv("STEADYDRIVE_VERSION_NAME") ?: "0.1.0"
+val resolvedVersionCode = readGradleOrEnv("STEADYDRIVE_VERSION_CODE")?.toIntOrNull() ?: 3
+val resolvedVersionName = readGradleOrEnv("STEADYDRIVE_VERSION_NAME") ?: "0.1.2"
 val releaseStoreFilePath = readGradleOrEnv("STEADYDRIVE_RELEASE_STORE_FILE")
 val releaseStorePassword = readGradleOrEnv("STEADYDRIVE_RELEASE_STORE_PASSWORD")
 val releaseKeyAlias = readGradleOrEnv("STEADYDRIVE_RELEASE_KEY_ALIAS")

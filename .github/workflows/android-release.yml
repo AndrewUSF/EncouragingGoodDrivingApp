@@ -9,7 +9,7 @@ on:
       release_tag:
         description: Git tag and GitHub Release tag to create or update
         required: true
-        default: android-v0.1.0
+        default: android-v0.1.2
       release_name:
         description: GitHub Release title
         required: true
@@ -17,11 +17,11 @@ on:
       version_name:
         description: Android versionName
         required: true
-        default: 0.1.0
+        default: 0.1.2
       version_code:
         description: Android versionCode. This must increase for every installable update.
         required: true
-        default: "1"
+        default: "3"
       prerelease:
         description: Mark the GitHub Release as a prerelease
         required: true
