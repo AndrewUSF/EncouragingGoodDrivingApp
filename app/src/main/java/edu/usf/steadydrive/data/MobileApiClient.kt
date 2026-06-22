@@ -1,6 +1,7 @@
 package edu.usf.steadydrive.data
 
 import android.os.Build
+import edu.usf.steadydrive.BuildConfig
 import edu.usf.steadydrive.model.AssignedDeviceConfig
 import edu.usf.steadydrive.model.DriveSessionSummary
 import edu.usf.steadydrive.model.ParticipantPhase
@@ -34,7 +35,7 @@ class MobileApiClient(
             .put("deviceModel", Build.MODEL)
             .put("manufacturer", Build.MANUFACTURER)
             .put("osVersion", Build.VERSION.RELEASE)
-            .put("appVersion", "0.1.0")
+            .put("appVersion", "${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE})")
             .put("timeZone", TimeZone.getDefault().id)
 
         postJson("/api/mobile/register", payload)
